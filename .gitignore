@@ -1,0 +1,22 @@
+# virtual environments
+.venv/
+venv/
+env/
+
+# python bytecode / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# editors / os
+.idea/
+.vscode/
+.DS_Store
+
+# scan output
+findings*.jsonl
+findings*.csv
+results*.jsonl
+results*.csv
