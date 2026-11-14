@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SRC LEAK CHECKER 1.0.0
+SRC LEAK CHECKER 1.1.0
 
 根目录备份 / 源码压缩包泄露自查工具（仅限授权目标）。
 
@@ -46,7 +46,7 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------
 
 # 语义化版本：不兼容改动升第一位，新增功能升第二位，修复问题升第三位
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # 固定使用常见浏览器 UA，降低被简单 UA 规则拦截的概率
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -60,6 +60,9 @@ MAX_REDIRECTS = 5   # 根 URL 最多跟随的跳转次数
 
 TIMEOUT = 8.0   # 单次请求超时（秒），固定值
 RETRIES = 1     # 失败重试次数，固定值
+
+# 软 404 指纹仍不稳定时，最多逐条展示的低置信可疑结果数
+MAX_UNSTABLE_REPORT = 5
 
 # 根目录候选后缀
 EXTS_DEFAULT = (
@@ -80,6 +83,17 @@ CORE_NAMES = (
 COMMON_NAMES = (
     "sql", "dump", "bak", "archive", "archives", "upload", "uploads",
     "release", "dist", "package", "mysql", "code",
+)
+
+# 组合式备份名：dirsearch 这类通用字典常见、但基础名单覆盖不到的高频命名
+BACKUP_COMBOS = (
+    "backups", "db_backup", "www_backup", "web_backup", "site_backup",
+    "html_backup", "public_html_backup", "public_backup", "htdocs_backup",
+    "mysql_backup", "database_backup", "sql_backup", "src_backup",
+    "code_backup", "app_backup", "project_backup", "release_backup",
+    "dist_backup", "upload_backup", "files_backup", "data_backup",
+    "backup_db", "backup_www", "backup_site", "wwwroot_backup",
+    "webroot_backup",
 )
 
 # 常见备份子目录组合：目录 × 名字 × 后缀
@@ -106,6 +120,22 @@ SQL_HINTS = (
     b"SET NAMES", b"LOCK TABLES", b"DELIMITER", b"ALTER TABLE",
     b"-- MySQL", b"-- PostgreSQL", b"-- Dump", b"pg_dump", b"/*!40",
     b"SQLite format 3",
+)
+
+# 软 404 指纹归一化：这些片段每次响应都可能变化，先替换再比较，
+# 否则 CDN/WAF 的 200 错误页会因随机 nonce 让基线指纹“不稳定”，
+# 导致软 404 过滤被整体关闭。
+DYNAMIC_PATTERNS = (
+    # UUID
+    (re.compile(rb"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                rb"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"), b"<UUID>"),
+    # ISO 日期时间
+    (re.compile(rb"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+                rb"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"), b"<TIME>"),
+    # 10~13 位秒/毫秒时间戳
+    (re.compile(rb"\b\d{10,13}\b"), b"<TS>"),
+    # 8 位以上的十六进制串（request-id / nonce / trace-id）
+    (re.compile(rb"\b[0-9a-fA-F]{8,}\b"), b"<HEX>"),
 )
 
 # 常见二进制 Content-Type（用于「可疑」判定）
@@ -366,8 +396,13 @@ def domain_names(base: str) -> set:
 
 
 def build_candidates(base: str) -> list:
-    """生成全部候选路径：根目录「名字 + 后缀」，以及常见备份子目录。"""
-    names = set(CORE_NAMES) | set(COMMON_NAMES) | domain_names(base)
+    """生成全部候选路径：根目录「名字 + 后缀」，以及常见备份子目录。
+
+    名字表已内置组合式备份名（backups / db_backup / site_backup 等），
+    不提供运行时追加，保持零配置。
+    """
+    names = (set(CORE_NAMES) | set(COMMON_NAMES) | set(BACKUP_COMBOS)
+             | domain_names(base))
 
     paths = set()
     for name in names:
@@ -567,6 +602,10 @@ class Scanner:
         self.console = console
         self.threads = threads
         self.baseline = Baseline()
+        # 软 404 存在但指纹不稳定时，类型判定的“可疑”结果噪声极大，
+        # 只展示前几条，其余折叠计数，避免刷屏。
+        self.wildcard_unstable = False
+        self.suppressed = 0
 
     # -- 目标准备 -----------------------------------------------------------
 
@@ -625,6 +664,8 @@ class Scanner:
         """请求两个随机路径，判断站点是否对不存在的路径返回 200/206。
 
         两次响应指纹一致时，才启用软 404 过滤；不一致则关闭过滤。
+        指纹比较前会归一化路径回显和随机 nonce/时间戳，避免动态错误页
+        被误判为“不稳定”。
         """
         baseline = Baseline()
         signatures = []
@@ -656,7 +697,7 @@ class Scanner:
                 except Exception:
                     pass
             signatures.append(
-                self._signature(ct, head, self._tokens(url)))
+                self._signature(status, ct, head, self._tokens(url)))
 
         baseline.status = first_status or 0
         baseline.wildcard = baseline.status in (200, 206)
@@ -669,7 +710,7 @@ class Scanner:
                 f"目标对不存在的路径返回 {baseline.status}（检测到软 404）")
             if baseline.stable:
                 self.console.info(
-                    f"基线指纹: {baseline.signature[1][:16]}")
+                    f"基线指纹: {baseline.signature[2][:16]}")
             else:
                 self.console.warning(
                     "基线指纹不稳定；已关闭软 404 过滤")
@@ -686,6 +727,7 @@ class Scanner:
     def scan(self, base: str, stats: Stats) -> None:
         """扫描单个目标，统计结果累加到 stats。"""
         self.baseline = Baseline()
+        self.suppressed = 0
 
         self.console.info(f"目标: {base}")
         self.console.info("正在测试目标 URL 连通性")
@@ -693,6 +735,9 @@ class Scanner:
 
         self.console.info("正在探测软 404 / 通配响应")
         self.baseline = self.probe_baseline(base)
+        # 归一化后指纹仍不一致：软 404 无法可靠过滤，降低可疑结果的展示量
+        self.wildcard_unstable = (self.baseline.wildcard
+                                  and not self.baseline.stable)
 
         paths = build_candidates(base)
         self.console.info(f"候选路径: {len(paths)}")
@@ -737,6 +782,11 @@ class Scanner:
 
         elapsed = time.monotonic() - started
         self.console.target_summary(elapsed, stats)
+
+        if self.suppressed > MAX_UNSTABLE_REPORT:
+            self.console.warning(
+                f"软404 指纹不稳定：{self.suppressed} 条低置信可疑响应，"
+                f"仅逐条显示前 {MAX_UNSTABLE_REPORT} 条")
 
         if total and stats.redirect > total * 0.5:
             self.console.warning(
@@ -801,7 +851,7 @@ class Scanner:
         # 与基线指纹一致 => 软 404，丢弃
         ct_lower = content_type.lower()
         if self.baseline.stable and self.baseline.signature:
-            if self._signature(content_type, head,
+            if self._signature(status, content_type, head,
                                self._tokens(url)) == self.baseline.signature:
                 return "soft404", None
 
@@ -848,7 +898,16 @@ class Scanner:
         if hit.verdict is Verdict.CONFIRMED:
             label, level, color = f"确认 {kind}", "严重", Color.RED
         else:
-            label, level, color = f"可疑 {kind}", "警告", Color.YELLOW
+            level, color = "警告", Color.YELLOW
+            # 403「受保护资源」不受软 404 影响，始终逐条展示；
+            # 其余仅凭 Content-Type 判定的可疑项在通配页上噪声极大，折叠。
+            if self.wildcard_unstable and hit.kind != "protected":
+                self.suppressed += 1
+                if self.suppressed > MAX_UNSTABLE_REPORT:
+                    return
+                label = f"可疑 {kind}（低置信）"
+            else:
+                label = f"可疑 {kind}"
         self.console.log(level, color,
                          f"{label}: {hit.url}  (状态: {hit.status}, "
                          f"大小: {fmt_size(hit.size)}, "
@@ -868,12 +927,25 @@ class Scanner:
                 if len(item) >= 4]
 
     @staticmethod
-    def _signature(ct: str, head: bytes, tokens: list) -> tuple:
-        """响应指纹：(Content-Type, 去掉路径片段后的正文哈希)。"""
+    def _normalize(head: bytes, tokens: list) -> bytes:
+        """去掉路径回显和动态片段，得到可比较的正文。"""
         body = head
         for token in tokens:
             body = body.replace(token, b"<PATH>")
-        return (base_ct(ct), hashlib.sha1(body).hexdigest())
+        for pattern, replacement in DYNAMIC_PATTERNS:
+            body = pattern.sub(replacement, body)
+        return body
+
+    @classmethod
+    def _signature(cls, status: int, ct: str, head: bytes,
+                   tokens: list) -> tuple:
+        """响应指纹：(状态码, Content-Type, 归一化正文哈希)。
+
+        先替换请求路径与随机 nonce/时间戳，再哈希；这样带动态内容的
+        错误页也能得到稳定指纹，不会因两次探测不一致而关闭软 404 过滤。
+        """
+        return (status, base_ct(ct),
+                hashlib.sha1(cls._normalize(head, tokens)).hexdigest())
 
 
 # --------------------------------------------------------------------------
